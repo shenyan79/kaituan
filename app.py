@@ -40,7 +40,7 @@ def transform_horizontal(df):
             if purchased_details:
                 results.append({
                     "名字": str(val_b).strip(),
-                    "（分类名称）/种类✖个数": " / ".join(purchased_details),
+                    "（分类名称）/种类✖个数": " ，".join(purchased_details),
                     "总点数": row_total_points,
                     "对应的总金额": str(val_a).strip()
                 })
@@ -182,4 +182,5 @@ if uploaded_file:
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 res_df.to_excel(writer, index=False)
             st.download_button("⬇️ 下载转换结果", output.getvalue(), f"转换_{uploaded_file.name}")
+
 
