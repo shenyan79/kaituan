@@ -1,116 +1,146 @@
 import streamlit as st
 import pandas as pd
-import os
-from io import BytesIO
+import tempfile
+
+st.set_page_config(page_title="重量 & 金额分摊工具", layout="wide")
+
+# =====================================================
+# Step 1：原始表 → 重量表
+# =====================================================
+def step1_generate_weight_excel(input_file):
+    all_sheets = pd.read_excel(input_file, sheet_name=None, header=None)
+    output_sheets = {}
+
+    for sheet_name, df in all_sheets.items():
+        if df.shape[0] < 6 or df.shape[1] < 3:
+            continue
+
+        # 制品重量（第 2 行，C 列起）
+        weights = pd.to_numeric(df.iloc[1, 2:], errors="coerce")
+
+        # 名字（第 6 行起，B 列）
+        names = df.iloc[5:, 1]
+
+        # 数量矩阵
+        qty = df.iloc[5:, 2:].fillna(0)
+        qty = qty.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+        total_weight = qty.dot(weights)
+
+        result_df = pd.DataFrame({
+            "名字": names.values,
+            "总重量(g)": total_weight.round(2)  # ⭐ 保留 2 位
+        }).dropna(subset=["名字"])
+
+        output_sheets[sheet_name] = result_df
+
+    return output_sheets
 
 
-def transform_excel(df: pd.DataFrame, original_filename: str):
-    # 输出文件名
-    file_name_part = os.path.splitext(original_filename)[0]
-    output_filename = f"改_{file_name_part}.xlsx"
+# =====================================================
+# Step 2：重量表 → 金额分摊表
+# =====================================================
+def step2_weight_to_amount(weight_excel, total_amount):
+    all_sheets = pd.read_excel(weight_excel, sheet_name=None)
+    final_df = None
 
-    # --- 1. 横向扫描分类 (第2行, 索引1) ---
-    col_to_category = {}
-    last_category = "默认分类"
+    for sheet_name, df in all_sheets.items():
+        if df.empty or "总重量(g)" not in df.columns:
+            continue
 
-    for col_idx in range(1, df.shape[1]):
-        cat_val = df.iloc[1, col_idx]
-        if pd.notna(cat_val) and str(cat_val).strip() not in ["", "分类"]:
-            last_category = str(cat_val).strip()
-        col_to_category[col_idx] = last_category
+        sheet_total_weight = df["总重量(g)"].sum()
+        if sheet_total_weight == 0:
+            continue
 
-    # --- 2. 提取制品名称 (第3行, 索引2) ---
-    product_names = {}
-    for col_idx in range(1, df.shape[1]):
-        name_val = df.iloc[2, col_idx]
-        if pd.isna(name_val) or str(name_val).strip() == "":
-            break
-        product_names[col_idx] = str(name_val).strip()
+        temp = df.copy()
+        temp[f"{sheet_name}_重量"] = temp["总重量(g)"].round(2)
+        temp[f"{sheet_name}_金额"] = (
+            temp["总重量(g)"] / sheet_total_weight * total_amount
+        ).round(3)  # ⭐ 金额 3 位小数
 
-    # --- 3. 遍历数据行 (从第6行[索引5]开始) ---
-    results = []
+        temp = temp[["名字", f"{sheet_name}_重量", f"{sheet_name}_金额"]]
 
-    for i in range(5, len(df)):
-        val_a = df.iloc[i, 0]  # A列：总金额
-        val_b = df.iloc[i, 1]  # B列：昵称
+        if final_df is None:
+            final_df = temp
+        else:
+            final_df = final_df.merge(temp, on="名字", how="outer")
 
-        if pd.notna(val_a) and pd.notna(val_b):
-            person_name = str(val_b).strip()
-            total_money = str(val_a).strip()
+    # 汇总金额
+    amount_cols = [c for c in final_df.columns if c.endswith("_金额")]
+    final_df["汇总金额"] = final_df[amount_cols].sum(axis=1, skipna=True).round(3)
 
-            purchased_details = []
-            row_total_points = 0
-
-            for col_idx in product_names.keys():
-                count = df.iloc[i, col_idx]
-                if pd.notna(count) and isinstance(count, (int, float)) and count > 0:
-                    category = col_to_category.get(col_idx, "默认分类")
-                    item_name = product_names[col_idx]
-
-                    row_total_points += int(count)
-
-                    if category == "默认分类":
-                        detail_str = f"{item_name}✖{int(count)}"
-                    else:
-                        detail_str = f"({category}){item_name}✖{int(count)}"
-
-                    purchased_details.append(detail_str)
-
-            if purchased_details:
-                results.append({
-                    "名字": person_name,
-                    "（分类名称）/种类✖个数": " / ".join(purchased_details),
-                    "总点数": row_total_points,
-                    "对应的总金额": total_money
-                })
-
-    if not results:
-        return None, None
-
-    final_df = pd.DataFrame(results)
-    final_df = final_df[["名字", "（分类名称）/种类✖个数", "总点数", "对应的总金额"]]
-
-    return final_df, output_filename
+    return final_df
 
 
-# ================= Streamlit UI =================
+# =====================================================
+# 🌈 Streamlit 前端
+# =====================================================
+st.title("📊 重量 & 金额分摊工具")
 
-st.set_page_config(page_title="Excel 汇总转换工具", layout="centered")
+tab1, tab2 = st.tabs(["Step 1：生成重量表", "Step 2：重量 → 金额分摊"])
 
-st.title("📊 Excel 汇总表 → 清单表转换工具")
-st.write("上传 Excel 文件，自动生成整理后的清单表（保持原有逻辑）")
 
-uploaded_file = st.file_uploader(
-    "📤 上传 Excel 文件",
-    type=["xlsx"]
-)
+# ==========================
+# Step 1 UI
+# ==========================
+with tab1:
+    st.subheader("Step 1：原始 Excel → 重量表")
 
-if uploaded_file is not None:
-    try:
-        df = pd.read_excel(uploaded_file, header=None)
-        st.success("✅ 文件读取成功")
+    uploaded_step1 = st.file_uploader(
+        "上传原始 Excel（含制品重量和数量）",
+        type=["xlsx"],
+        key="step1"
+    )
 
-        if st.button("🚀 开始处理"):
-            with st.spinner("处理中，请稍候..."):
-                result_df, out_name = transform_excel(df, uploaded_file.name)
+    if uploaded_step1:
+        weight_sheets = step1_generate_weight_excel(uploaded_step1)
 
-            if result_df is None:
-                st.error("❌ 未提取到有效数据，请检查 A 列和 B 列内容")
-            else:
-                st.success("🎉 处理完成！")
-                st.dataframe(result_df)
+        if weight_sheets:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+                    for sheet, df in weight_sheets.items():
+                        df.to_excel(writer, sheet_name=sheet, index=False)
 
-                # 转成 Excel 供下载
-                buffer = BytesIO()
-                result_df.to_excel(buffer, index=False)
-                buffer.seek(0)
-
+                st.success("✅ 重量表生成成功")
                 st.download_button(
-                    label="⬇️ 下载处理后的 Excel",
-                    data=buffer,
-                    file_name=out_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    "📥 下载：重量表.xlsx",
+                    open(tmp.name, "rb"),
+                    file_name="重量表.xlsx"
                 )
+        else:
+            st.warning("未识别到有效的 Sheet")
 
-    except Exception as e:
-        st.error(f"❌ 处理失败：{e}")
+
+# ==========================
+# Step 2 UI
+# ==========================
+with tab2:
+    st.subheader("Step 2：重量表 → 金额分摊表（国际表）")
+
+    uploaded_step2 = st.file_uploader(
+        "上传 Step 1 生成的【重量表.xlsx】",
+        type=["xlsx"],
+        key="step2"
+    )
+
+    total_amount = st.number_input(
+        "输入总金额",
+        min_value=0.0,
+        step=100.0
+    )
+
+    if uploaded_step2 and total_amount > 0:
+        final_df = step2_weight_to_amount(uploaded_step2, total_amount)
+
+        if final_df is not None:
+            st.dataframe(final_df)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                final_df.to_excel(tmp.name, index=False)
+                st.download_button(
+                    "📥 下载：国际表_重量分摊.xlsx",
+                    open(tmp.name, "rb"),
+                    file_name="国际表_重量分摊.xlsx"
+                )
+        else:
+            st.warning("未生成有效数据")
